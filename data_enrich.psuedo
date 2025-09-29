@@ -1,0 +1,607 @@
+
+================================================================================
+MAIN PIPELINE WITH CONFIG SUPPORT
+================================================================================
+
+FUNCTION transform_crop_data_to_features(crop_records, default_configs=None):
+    """
+    Main entry point with configuration support
+    
+    INPUT: crop_records = [
+        {
+            crop_variety: "Maize-Variety-A",
+            plant_month: "May",
+            location_key: "LOC-001",
+            elevation: 1200,
+            soil_properties: {...},
+            
+            // OPTIONAL: Crop-specific configuration
+            crop_config: {
+                thermal: {base_temperature: 8},  // Override just base temp
+                stress_thresholds: {heat_stress_temp: 30},
+                // ... other overrides
+            },
+            
+            weather_time_series: [...],
+            performance_scores: [...]
+        },
+        ...
+    ]
+    
+    default_configs: Optional dictionary mapping crop types to default configs
+                     e.g., {"maize": MAIZE_CONFIG, "wheat": WHEAT_CONFIG}
+    """
+    
+    transformed_records = []
+    
+    FOR EACH crop_record IN crop_records:
+        
+        // STEP 1: Resolve configuration
+        config = resolve_crop_configuration(
+            crop_record,
+            default_configs
+        )
+        
+        // Validate configuration
+        validate_configuration(config)
+        
+        // STEP 2: Extract static features (same across all years)
+        static_features = extract_static_features(crop_record, config)
+        
+        // STEP 3: Process each year independently
+        feature_label_pairs = []
+        
+        FOR EACH year_data IN crop_record.weather_time_series:
+            
+            // Validate time series
+            IF NOT validate_time_series(year_data.daily_data, config):
+                LOG_WARNING(f"Skipping year {year_data.year} - data quality issues")
+                CONTINUE
+            
+            // Find corresponding performance score
+            year = year_data.year
+            performance = find_score_for_year(
+                crop_record.performance_scores, 
+                year
+            )
+            
+            IF performance IS NULL:
+                CONTINUE  // Skip years without labels
+            
+            // Generate temporal features with crop-specific config
+            temporal_features = generate_temporal_features(
+                year_data.daily_data,
+                crop_record.plant_month,
+                config  // Pass configuration
+            )
+            
+            // Combine all features
+            combined_features = merge_dictionaries(
+                static_features,
+                temporal_features
+            )
+            
+            // Create feature-label pair
+            feature_label_pairs.APPEND({
+                year: year,
+                features: combined_features,
+                label: performance.score,
+                config_used: get_config_summary(config)  // For tracking
+            })
+        
+        // Create transformed record
+        transformed_records.APPEND({
+            crop_variety: crop_record.crop_variety,
+            plant_month: crop_record.plant_month,
+            location_key: crop_record.location_key,
+            feature_label_pairs: feature_label_pairs
+        })
+    
+    RETURN transformed_records
+
+
+================================================================================
+MODULE: Configuration Resolution
+================================================================================
+
+FUNCTION resolve_crop_configuration(crop_record, default_configs):
+    """
+    Resolve final configuration by merging defaults with overrides
+    Priority: custom config > crop type default > system default
+    """
+    
+    // Start with system-wide defaults
+    config = get_system_default_config()
+    
+    // Apply crop-type defaults if available
+    IF default_configs IS NOT NULL:
+        crop_type = extract_crop_type(crop_record.crop_variety)
+        
+        IF crop_type IN default_configs:
+            config = deep_merge(config, default_configs[crop_type])
+    
+    // Apply record-specific overrides
+    IF crop_record.crop_config EXISTS:
+        config = deep_merge(config, crop_record.crop_config)
+    
+    RETURN config
+
+
+FUNCTION get_system_default_config():
+    """
+    System-wide default configuration
+    Conservative values that work reasonably for most crops
+    """
+    
+    RETURN {
+        phenology: {
+            early_vegetative: {start_pct: 0, end_pct: 25},
+            vegetative: {start_pct: 25, end_pct: 50},
+            reproductive: {start_pct: 40, end_pct: 75},
+            maturation: {start_pct: 70, end_pct: 100},
+            critical_period: {start_pct: 40, end_pct: 70},
+        },
+        thermal: {
+            base_temperature: 10,
+            optimal_temperature: 25,
+            max_temperature: 35,
+            gdd_calculation_method: "simple",
+        },
+        stress_thresholds: {
+            heat_stress_temp: 32,
+            extreme_heat_temp: 38,
+            heat_stress_duration: 3,
+            cold_stress_temp: 5,
+            frost_temp: 0,
+            freezing_damage_temp: -2,
+            drought_soil_moisture: 0.15,
+            severe_drought_moisture: 0.10,
+            waterlogging_moisture: 0.35,
+            high_vpd: 2.5,
+            extreme_vpd: 4.0,
+            dry_day_threshold: 1.0,
+            heavy_rain_threshold: 25,
+            strong_wind_threshold: 15,
+            extreme_wind_threshold: 20,
+        },
+        feature_importance: {
+            weight_early_season: 1.0,
+            weight_reproductive: 1.5,
+            weight_maturation: 0.8,
+            heat_stress_weight: 1.0,
+            cold_stress_weight: 1.0,
+            drought_stress_weight: 1.2,
+            vpd_stress_weight: 0.8,
+        },
+        rolling_windows: {
+            short_window: 7,
+            medium_window: 14,
+            long_window: 30,
+            critical_window: 7,
+        },
+        crop_characteristics: {
+            is_perennial: false,
+            photoperiod_sensitive: false,
+            deep_rooted: false,
+            c4_photosynthesis: false,
+            frost_tolerant: false,
+            flood_tolerant: false,
+            typical_season_length: 120,
+            min_season_length: 60,
+            max_season_length: 200,
+        },
+        interactions: {
+            heat_drought_multiplier: 1.5,
+            wind_precipitation_factor: 0.8,
+        },
+        data_handling: {
+            max_missing_days: 7,
+            interpolate_missing: true,
+            outlier_detection: true,
+            outlier_threshold: 4.0,
+        }
+    }
+
+
+FUNCTION validate_configuration(config):
+    """
+    Validate configuration values are sensible
+    """
+    
+    // Check thermal parameters
+    ASSERT config.thermal.base_temperature < config.thermal.optimal_temperature,
+           "Base temperature must be less than optimal"
+    
+    ASSERT config.thermal.optimal_temperature < config.thermal.max_temperature,
+           "Optimal temperature must be less than max"
+    
+    // Check phenology boundaries
+    stages = config.phenology
+    FOR EACH stage IN stages:
+        IF "start_pct" IN stage:
+            ASSERT 0 <= stage.start_pct <= 100, "Invalid percentage"
+            ASSERT 0 <= stage.end_pct <= 100, "Invalid percentage"
+            ASSERT stage.start_pct < stage.end_pct, "Invalid stage boundaries"
+    
+    // Check stress thresholds are logical
+    ASSERT config.stress_thresholds.drought_soil_moisture > 
+           config.stress_thresholds.severe_drought_moisture,
+           "Severe drought threshold must be lower"
+    
+    ASSERT config.stress_thresholds.heat_stress_temp < 
+           config.stress_thresholds.extreme_heat_temp,
+           "Extreme heat threshold must be higher"
+    
+    // Validate season length
+    ASSERT config.crop_characteristics.min_season_length < 
+           config.crop_characteristics.max_season_length,
+           "Invalid season length range"
+
+
+FUNCTION validate_time_series(daily_data, config):
+    """
+    Check if time series meets quality requirements
+    """
+    
+    season_length = LENGTH(daily_data)
+    
+    // Check season length is within expected range
+    IF season_length < config.crop_characteristics.min_season_length OR
+       season_length > config.crop_characteristics.max_season_length:
+        LOG_WARNING(f"Season length {season_length} outside expected range")
+        RETURN false
+    
+    // Check for missing data
+    IF config.data_handling.outlier_detection:
+        missing_count = count_missing_values(daily_data)
+        consecutive_missing = max_consecutive_missing(daily_data)
+        
+        IF consecutive_missing > config.data_handling.max_missing_days:
+            LOG_WARNING(f"Too many consecutive missing days: {consecutive_missing}")
+            RETURN false
+    
+    RETURN true
+
+
+FUNCTION extract_crop_type(crop_variety):
+    """
+    Extract crop type from variety name
+    e.g., "Maize-Hybrid-123" -> "maize"
+    """
+    
+    // Simple heuristic - take first word before delimiter
+    parts = SPLIT(crop_variety.LOWER(), "-")
+    IF LENGTH(parts) > 0:
+        RETURN parts[0]
+    
+    RETURN "unknown"
+
+
+FUNCTION deep_merge(base_dict, override_dict):
+    """
+    Recursively merge override_dict into base_dict
+    Override values take precedence
+    """
+    
+    result = COPY(base_dict)
+    
+    FOR EACH key, value IN override_dict:
+        IF key IN result AND BOTH result[key] AND value ARE DICTIONARIES:
+            result[key] = deep_merge(result[key], value)
+        ELSE:
+            result[key] = value
+    
+    RETURN result
+
+
+FUNCTION get_config_summary(config):
+    """
+    Create compact summary of config for tracking
+    """
+    
+    RETURN {
+        base_temp: config.thermal.base_temperature,
+        heat_threshold: config.stress_thresholds.heat_stress_temp,
+        drought_threshold: config.stress_thresholds.drought_soil_moisture,
+        critical_period: config.phenology.critical_period
+    }
+
+
+================================================================================
+UPDATED MODULE: Cumulative Features with Config
+================================================================================
+
+FUNCTION calculate_cumulative_features(daily_data, stages, config):
+    """
+    Features that accumulate over time - now config-aware
+    """
+    
+    features = {}
+    
+    // Get thermal parameters from config
+    BASE_TEMP = config.thermal.base_temperature
+    OPTIMAL_TEMP = config.thermal.optimal_temperature
+    MAX_TEMP = config.thermal.max_temperature
+    GDD_METHOD = config.thermal.gdd_calculation_method
+    
+    // Calculate daily GDD based on method
+    daily_gdd = []
+    FOR EACH day IN daily_data:
+        gdd = calculate_gdd(
+            day.temperature_2m_mean,
+            day.temperature_2m_min,
+            day.temperature_2m_max,
+            BASE_TEMP,
+            OPTIMAL_TEMP,
+            MAX_TEMP,
+            GDD_METHOD
+        )
+        daily_gdd.APPEND(gdd)
+    
+    // Total season GDD
+    features.total_gdd = SUM(daily_gdd)
+    
+    // GDD by stage with importance weighting
+    FOR EACH stage_name, stage_period IN stages:
+        stage_gdd = slice_data(daily_gdd, stage_period.start_day, stage_period.end_day)
+        stage_data = slice_data(daily_data, stage_period.start_day, stage_period.end_day)
+        
+        // Base GDD feature
+        gdd_sum = SUM(stage_gdd)
+        features[stage_name + "_gdd"] = gdd_sum
+        
+        // Apply importance weighting if configured
+        weight_key = "weight_" + stage_name
+        IF weight_key IN config.feature_importance:
+            weight = config.feature_importance[weight_key]
+            features[stage_name + "_gdd_weighted"] = gdd_sum * weight
+        
+        // Precipitation features
+        features[stage_name + "_precipitation"] = SUM_FIELD(stage_data, "precipitation_sum")
+        features[stage_name + "_rain"] = SUM_FIELD(stage_data, "rain_sum")
+    
+    // Cumulative precipitation
+    features.total_precipitation = SUM_FIELD(daily_data, "precipitation_sum")
+    features.total_rain = SUM_FIELD(daily_data, "rain_sum")
+    
+    // Precipitation distribution
+    early_precip = features.early_vegetative_precipitation
+    late_precip = features.maturation_precipitation
+    
+    IF late_precip > 0.01:
+        features.precip_early_late_ratio = early_precip / late_precip
+    ELSE:
+        features.precip_early_late_ratio = early_precip / 0.01
+    
+    RETURN features
+
+
+FUNCTION calculate_gdd(temp_mean, temp_min, temp_max, base, optimal, max_temp, method):
+    """
+    Calculate Growing Degree Days with multiple methods
+    """
+    
+    IF method == "simple":
+        // Simple method: (Tavg - Tbase)
+        RETURN MAX(0, temp_mean - base)
+    
+    ELSE IF method == "modified":
+        // Modified method: cap at upper threshold
+        temp_capped = MIN(temp_mean, optimal)
+        RETURN MAX(0, temp_capped - base)
+    
+    ELSE IF method == "triangular":
+        // Triangular method using min/max
+        // More accurate but complex
+        IF temp_max <= base:
+            RETURN 0
+        
+        IF temp_min >= optimal:
+            RETURN optimal - base
+        
+        IF temp_min >= base AND temp_max <= optimal:
+            RETURN (temp_max + temp_min) / 2 - base
+        
+        // Partial accumulation (simplified version)
+        avg_temp = (temp_max + temp_min) / 2
+        RETURN MAX(0, MIN(avg_temp - base, optimal - base))
+    
+    ELSE:
+        // Default to simple
+        RETURN MAX(0, temp_mean - base)
+
+
+================================================================================
+UPDATED MODULE: Stress Events with Config
+================================================================================
+
+FUNCTION calculate_stress_events(daily_data, stages, config):
+    """
+    Identify and quantify stress events - config-aware
+    """
+    
+    features = {}
+    
+    // Extract thresholds from config
+    HEAT_THRESHOLD = config.stress_thresholds.heat_stress_temp
+    EXTREME_HEAT = config.stress_thresholds.extreme_heat_temp
+    HEAT_DURATION = config.stress_thresholds.heat_stress_duration
+    
+    COLD_THRESHOLD = config.stress_thresholds.cold_stress_temp
+    FROST_THRESHOLD = config.stress_thresholds.frost_temp
+    
+    MOISTURE_THRESHOLD = config.stress_thresholds.drought_soil_moisture
+    SEVERE_DROUGHT = config.stress_thresholds.severe_drought_moisture
+    WATERLOG_THRESHOLD = config.stress_thresholds.waterlogging_moisture
+    
+    HIGH_VPD_THRESHOLD = config.stress_thresholds.high_vpd
+    EXTREME_VPD = config.stress_thresholds.extreme_vpd
+    
+    // Calculate daily VPD
+    daily_vpd = []
+    FOR EACH day IN daily_data:
+        vpd = calculate_vpd(
+            day.temperature_2m_mean,
+            day.relative_humidity_2m_mean
+        )
+        daily_vpd.APPEND(vpd)
+    
+    // HEAT STRESS
+    heat_stress_days = COUNT_IF(daily_data, temperature_2m_max > HEAT_THRESHOLD)
+    features.heat_stress_days_total = heat_stress_days
+    
+    extreme_heat_days = COUNT_IF(daily_data, temperature_2m_max > EXTREME_HEAT)
+    features.extreme_heat_days_total = extreme_heat_days
+    
+    // Apply importance weighting
+    IF "heat_stress_weight" IN config.feature_importance:
+        weight = config.feature_importance.heat_stress_weight
+        features.heat_stress_days_weighted = heat_stress_days * weight
+    
+    // Heat stress during critical period
+    critical_data = slice_data(
+        daily_data, 
+        stages.critical_period.start_day,
+        stages.critical_period.end_day
+    )
+    features.heat_stress_days_critical = COUNT_IF(
+        critical_data, 
+        temperature_2m_max > HEAT_THRESHOLD
+    )
+    
+    // Consecutive heat stress (considering duration threshold)
+    features.max_consecutive_heat_days = find_longest_streak(
+        daily_data,
+        LAMBDA(day): day.temperature_2m_max > HEAT_THRESHOLD,
+        min_duration=HEAT_DURATION
+    )
+    
+    // COLD STRESS (only if crop is not frost tolerant)
+    IF NOT config.crop_characteristics.frost_tolerant:
+        features.frost_events = COUNT_IF(daily_data, temperature_2m_min < FROST_THRESHOLD)
+        features.cold_stress_days = COUNT_IF(daily_data, temperature_2m_min < COLD_THRESHOLD)
+    ELSE:
+        // For frost-tolerant crops, use more extreme threshold
+        SEVERE_FROST = config.stress_thresholds.freezing_damage_temp
+        features.severe_frost_events = COUNT_IF(daily_data, temperature_2m_min < SEVERE_FROST)
+    
+    // DROUGHT STRESS
+    drought_days = COUNT_IF(
+        daily_data,
+        soil_moisture_0_to_10cm_mean < MOISTURE_THRESHOLD
+    )
+    features.drought_stress_days_total = drought_days
+    
+    severe_drought_days = COUNT_IF(
+        daily_data,
+        soil_moisture_0_to_10cm_mean < SEVERE_DROUGHT
+    )
+    features.severe_drought_days_total = severe_drought_days
+    
+    // Apply importance weighting
+    IF "drought_stress_weight" IN config.feature_importance:
+        weight = config.feature_importance.drought_stress_weight
+        features.drought_stress_days_weighted = drought_days * weight
+    
+    // Drought during critical period
+    features.drought_stress_days_critical = COUNT_IF(
+        critical_data,
+        soil_moisture_0_to_10cm_mean < MOISTURE_THRESHOLD
+    )
+    
+    // Consecutive dry days
+    DRY_THRESHOLD = config.stress_thresholds.dry_day_threshold
+    features.max_consecutive_dry_days = find_longest_streak(
+        daily_data,
+        LAMBDA(day): day.precipitation_sum < DRY_THRESHOLD
+    )
+    
+    // WATERLOGGING (only if crop is not flood tolerant)
+    IF NOT config.crop_characteristics.flood_tolerant:
+        HEAVY_RAIN = config.stress_thresholds.heavy_rain_threshold
+        waterlogging_days = 0
+        FOR i FROM 0 TO LENGTH(daily_data) - 1:
+            IF daily_data[i].soil_moisture_0_to_10cm_mean > WATERLOG_THRESHOLD AND
+               daily_data[i].precipitation_sum > HEAVY_RAIN:
+                waterlogging_days += 1
+        features.waterlogging_risk_days = waterlogging_days
+    
+    // VPD STRESS
+    features.high_vpd_days_total = COUNT(daily_vpd > HIGH_VPD_THRESHOLD)
+    features.extreme_vpd_days_total = COUNT(daily_vpd > EXTREME_VPD)
+    
+    critical_vpd = slice_data(
+        daily_vpd,
+        stages.critical_period.start_day,
+        stages.critical_period.end_day
+    )
+    features.high_vpd_days_critical = COUNT(critical_vpd > HIGH_VPD_THRESHOLD)
+    
+    // Apply VPD weight
+    IF "vpd_stress_weight" IN config.feature_importance:
+        weight = config.feature_importance.vpd_stress_weight
+        features.high_vpd_days_weighted = features.high_vpd_days_total * weight
+    
+    // Cumulative VPD stress
+    features.cumulative_vpd_stress = SUM(
+        MAP(daily_vpd, LAMBDA(vpd): MAX(0, vpd - HIGH_VPD_THRESHOLD))
+    )
+    
+    // WIND STRESS
+    STRONG_WIND = config.stress_thresholds.strong_wind_threshold
+    EXTREME_WIND = config.stress_thresholds.extreme_wind_threshold
+    
+    features.strong_wind_days = COUNT_IF(
+        daily_data,
+        wind_speed_10m_max > STRONG_WIND
+    )
+    features.extreme_wind_days = COUNT_IF(
+        daily_data,
+        wind_speed_10m_max > EXTREME_WIND
+    )
+    
+    RETURN features
+
+
+FUNCTION find_longest_streak(data, condition_function, min_duration=1):
+    """
+    Find longest consecutive sequence where condition is true
+    Only count streaks that meet minimum duration
+    """
+    max_streak = 0
+    current_streak = 0
+    
+    FOR EACH item IN data:
+        IF condition_function(item):
+            current_streak += 1
+        ELSE:
+            IF current_streak >= min_duration:
+                max_streak = MAX(max_streak, current_streak)
+            current_streak = 0
+    
+    // Check final streak
+    IF current_streak >= min_duration:
+        max_streak = MAX(max_streak, current_streak)
+    
+    RETURN max_streak
+
+
+================================================================================
+UPDATED MODULE: Interaction Features with Config
+================================================================================
+
+FUNCTION calculate_interactions(daily_data, config):
+    """
+    Features combining multiple variables - config-aware
+    """
+    
+    features = {}
+    
+    // Heat-humidity index
+    heat_humidity_values = []
+    FOR EACH day IN daily_data:
+        hhi = day.temperature_2m_mean * (day.relative_humidity_2m_mean / 100)
+        heat_humidity_values.APPEND(hhi)
+    
+    features.heat_humidity_index_mean = MEAN(heat_humidity_values)
+    features.heat_humidity_index_max = MAX(heat_humidity_values)
